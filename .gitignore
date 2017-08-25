@@ -96,4 +96,8 @@ ENV/
 # mkdocs documentation
 /site
 
+# vim
+.session.vim
+.swp
+
 numerai_datasets/

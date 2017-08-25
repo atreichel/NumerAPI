@@ -1,0 +1,22 @@
+version: 2
+jobs:
+  build:
+    working_directory: ~/repo
+    docker:
+      - image: circleci/python:3.5.3
+      - image: circleci/mysql:5.6
+      - image: circleci/mongo:3.0.14
+    steps:
+      - checkout
+      - run: 
+          name: Install Python Dependencies
+          command: |
+            python3 -m venv venv
+            . venv/bin/activate
+            cd ~/repo && pip install -e . | tee
+      - run:
+          name: Lint Python Packages
+          command: |
+            . venv/bin/activate
+            flake8 --config=./.flake8 ./
+            find . -iname "*.py" ! -name "setup.py" ! -name "__init__.py" ! -path "./venv/*" | xargs pylint --rcfile=./.pylintrc

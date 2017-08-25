@@ -1,0 +1,3 @@
+[flake8]
+ignore = E501, E701
+exclude = setup.py, __init__.py, venv

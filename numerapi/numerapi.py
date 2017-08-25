@@ -2,179 +2,408 @@
 
 # System
 import zipfile
+import json
+import os
 from datetime import datetime, timedelta
+import getpass
+import errno
+import logging
 
 # Third Party
 import requests
 import numpy as np
 
+
 class NumerAPI(object):
-    def __init__(self):
-        api_url = "https://api.numer.ai"
-        new_api_url = "https://api-hs.numer.ai"
-        self._login_url = api_url + '/sessions'
-        self._auth_url = api_url + '/upload/auth'
-        self._dataset_url = api_url + '/competitions/current/dataset'
-        self._submissions_url = api_url + '/submissions'
-        self._users_url = api_url + '/users'
-        self.leaderboard_url = api_url + '/competitions'
-        self.new_leaderboard_url = new_api_url + '/leaderboard'
-        self.new_current_leaderboard_url = new_api_url + '/currentLeaderboard'
 
-    @property
-    def credentials(self):
-        if not hasattr(self, "_credentials"):
-            raise ValueError("You haven't yet set your email and password credentials.  Set it first with NumeraAPI().credentials = ('YOUR_EMAIL', 'YOUR_PASSWORD')")
-        return self._credentials
+    """Wrapper around the Numerai API"""
 
-    @credentials.setter
-    def credentials(self, value):
-        self._credentials = {"email": value[0], "password": value[1]}
+    def __init__(self, verbosity="INFO"):
+        """
+        initialize Numerai API wrapper for Python
 
-    def download_current_dataset(self, dest_path='.', unzip=True):
-        now = datetime.now().strftime('%Y%m%d')
-        file_name = 'numerai_dataset_{0}.zip'.format(now)
-        dest_file_path = '{0}/{1}'.format(dest_path, file_name)
+        verbosity: indicates what level of messages should be displayed
+            valid values: "debug", "info", "warning", "error", "critical"
+        """
+        self.logger = logging.getLogger(__name__)
 
-        r = requests.get(self._dataset_url, stream=True)
-        if r.status_code != 200:
-            return r.status_code
+        # set up logging
+        numeric_log_level = getattr(logging, verbosity.upper())
+        if not isinstance(numeric_log_level, int):
+            raise ValueError('invalid verbosity: %s' % verbosity)
+        log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+        self._date_format = "%Y-%m-%dT%H:%M:%S"
+        logging.basicConfig(format=log_format, level=numeric_log_level,
+                            datefmt=self._date_format)
 
-        with open(dest_file_path, 'wb') as f:
-            for chunk in r.iter_content(1024):
+        # Numerai API base URL
+        self.api_base_url = "https://api.numer.ai"
+
+        # first round to check for scores
+        self._FIRST_ROUND = 51
+
+        # error indicating user is not logged in
+        not_logged_in_msg = "username not specified and not logged in"
+        self._not_logged_in_error = ValueError(not_logged_in_msg)
+        self._username = None
+        self._access_token = None
+        self.url_paths = None
+
+    def __get_url(self, url_path_name, query_params=None):
+        """get url with query params for Numerai API"""
+
+        # mappings of URL path names to URL paths
+        self.url_paths = {
+            "login": "/sessions",
+            "auth": "/submission_authorizations",
+            "dataset": "/competitions/current/dataset",
+            "submissions": "/submissions",
+            "users": "/users",
+            "competitions": "/competitions",
+            "competitions_by_id": "/competitions/id",
+            "current_leaderboard_url": "/currentLeaderboard"
+        }
+
+        # set query params based on type
+        if query_params is None:
+            query_params_str = ""
+        elif isinstance(query_params, dict):
+            query_params_str = "?" + json.dumps(query_params)
+        elif isinstance(query_params, str):
+            query_params_str = "?" + query_params
+        else:
+            self.logger.warning("invalid query params")
+            query_params = ""
+
+        return (self.api_base_url +
+                self.url_paths[url_path_name] +
+                query_params_str)
+
+    def __get_username(self, username):
+        """set username if logged in and not specified"""
+        if username is None:
+            if hasattr(self, "_username"):
+                username = self._username
+            else:
+                raise self._not_Logged_in_error
+
+        return username
+
+    def __unzip_file(self, src_path, dest_path, filename):
+        """unzips file located at src_path into destination_path"""
+        self.logger.info("unzipping file...")
+
+        # construct full path (including file name) for unzipping
+        unzip_path = "{0}/{1}".format(dest_path, filename)
+
+        # create parent directory for unzipped data
+        try:
+            os.makedirs(unzip_path)
+        except OSError as exception:
+            if exception.errno != errno.EEXIST:
+                raise
+
+        # extract data
+        with zipfile.ZipFile(src_path, "r") as z:
+            z.extractall(unzip_path)
+
+        return True
+
+    def __authorize_file_upload(self, file_path):
+        """authorize file upload"""
+        self.logger.info("authorizing file upload...")
+
+        # user must be logged in in order to upload files
+        if not hasattr(self, "_access_token"):
+            self.logger.error("you must log in first")
+            self.login()
+
+        # set up request parameters
+        auth_headers = {
+            "Authorization": "Bearer {0}".format(self._access_token)
+        }
+        auth_url = self.__get_url("auth")
+        auth_data = {
+            "filename": file_path.split("/")[-1],
+            "mimetype": "text/csv"
+        }
+
+        # send auth request
+        auth_res = requests.post(auth_url, data=auth_data,
+                                 headers=auth_headers)
+        auth_res.raise_for_status()
+
+        # parse auth response
+        auth_res_dict = auth_res.json()
+        filename = auth_res_dict["filename"]
+        signed_req = auth_res_dict["signedRequest"]
+
+        return (filename, signed_req, auth_headers)
+
+    def login(self, email=None, password=None, mfa_enabled=False):
+        """log user in and store credentials"""
+        self.logger.info("logging in...")
+
+        # get login parameters if necessary
+        if email is None:
+            email = input("email: ")
+        if password is None:
+            password = getpass.getpass("password: ")
+        mfa_code = None
+        if mfa_enabled:
+            mfa_code = getpass.getpass("MFA code: ")
+
+        # send login request
+        post_data = {"email": email, "password": password, "code": mfa_code}
+        login_url = self.__get_url("login")
+        login_res = requests.post(login_url, data=post_data)
+        login_res.raise_for_status()
+
+        # parse login response
+        user = login_res.json()
+        access_token = user["accessToken"]
+        username = user["username"]
+
+        # set instance variables
+        self._access_token = access_token
+        self._username = username
+
+        # set up return object
+        whitelisted_keys = ["username", "accessToken", "refreshToken"]
+        user_credentials = {key: user[key] for key in whitelisted_keys}
+
+        return user_credentials
+
+    def download_current_dataset(self, dest_path=".", unzip=True):
+        """download dataset for current round
+
+        dest_path: desired location of dataset file
+        unzip: indicates whether to unzip dataset
+        """
+        self.logger.info("downloading current dataset...")
+
+        # set up download path
+        now = datetime.now().strftime("%Y%m%d")
+        dataset_name = "numerai_dataset_{0}".format(now)
+        file_name = "{0}.zip".format(dataset_name)
+        dataset_path = "{0}/{1}".format(dest_path, file_name)
+
+        # get data for current dataset
+        dataset_res = requests.get(self.__get_url("dataset"), stream=True)
+        dataset_res.raise_for_status()
+
+        # create parent folder if necessary
+        try:
+            os.makedirs(dest_path)
+        except OSError as exception:
+            if exception.errno != errno.EEXIST:
+                raise
+
+        # write dataset to file
+        with open(dataset_path, "wb") as f:
+            for chunk in dataset_res.iter_content(1024):
                 f.write(chunk)
 
+        # unzip dataset
         if unzip:
-            with zipfile.ZipFile(dest_file_path, "r") as z:
-                z.extractall(dest_path)
-        return r.status_code
+            self.__unzip_file(dataset_path, dest_path, dataset_name)
 
+        return True
 
-    def get_new_leaderboard(self, n=None):
-        if n is None:
-            url = self.new_current_leaderboard_url
+    def get_all_competitions(self):
+        """get all competitions from first round stored in instance variable"""
+        self.logger.info("getting all competitions...")
+
+        # get latest round to determine end of round ID range
+        current_round = self.get_competition()
+        last_round_id = current_round["_id"]
+
+        # store data from all competitions
+        all_competitions = []
+        for i in range(self._FIRST_ROUND, last_round_id):
+            all_competitions.append(self.get_competition(round_id=i))
+        all_competitions.append(current_round)
+
+        return all_competitions
+
+    def get_competition(self, round_id=None):
+        """get a specific competiton, defaults to most recent"""
+        self.logger.info("getting competition...")
+
+        # set up request URL
+        # defaults to getting most recent round
+        if round_id is None:
+            # indicates that the API returns an array and should be parsed
+            # accordingly
+            returns_array = True
+
+            # set up JSON query
+            now = datetime.now()
+            tdelta = timedelta(microseconds=55296e5)
+            current_date = now - tdelta
+            current_date_str = current_date.strftime(self._date_format)
+            jsonq = {
+                "end_date": {
+                    "$gt": current_date_str
+                }
+            }
+
+            comp_req_url = self.__get_url("competitions", query_params=jsonq)
+
+        # otherwise set up the request with the specified round ID
         else:
-            url = self.new_leaderboard_url + "?round={}".format(n)
-        r = requests.get(url)
-        return (r.json(), r.status_code)
+            returns_array = False
+            jsonq = {"id": str(round_id)}
+            comp_req_url = self.__get_url("competitions_by_id", query_params=jsonq)
 
-    def get_leaderboard(self):
-        now = datetime.now()
-        tdelta = timedelta(microseconds=55296e5)
-        dt = now - tdelta
-        dt_str = dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        # send compititon request
+        comp_res = requests.get(comp_req_url)
+        comp_res.raise_for_status()
 
-        url = self.leaderboard_url + '?{ leaderboard :'
-        url += ' current , end_date :{ $gt : %s }}'
-        r = requests.get((url % (dt_str)).replace(' ', '%22'))
-        if r.status_code != 200:
-            return (None, r.status_code)
-        return (r.json(), r.status_code)
+        # parse competition response
+        competition = comp_res.json()
+        if returns_array:
+            competition = competition[0]
 
+        return competition
 
-    def get_earnings_per_round(self, username):
-        r = requests.get('{0}/{1}'.format(self._users_url, username))
-        if r.status_code != 200:
-            return (None, r.status_code)
+    def get_earnings_per_round(self, username=None):
+        """get earnings for every round"""
+        self.logger.info("getting earnings...")
 
-        rj = r.json()
-        rewards = rj['rewards']
-        earnings = np.zeros(len(rewards))
-        for i in range(len(rewards)):
-            earnings[i] = rewards[i]['amount']
-        return (earnings, r.status_code)
+        # construct user request URL
+        username = self.__get_username(username)
+        user_req_url = "{0}/{1}".format(self.__get_url("users"), username)
 
+        # send user request
+        user_res = requests.get(user_req_url)
+        user_res.raise_for_status()
 
-    def get_scores(self, username):
-        r = requests.get('{0}/{1}'.format(self._users_url, username))
-        if r.status_code != 200:
-            return (None, r.status_code)
+        # parse response
+        user = user_res.json()
+        rewards = user["rewards"]
+        num_rewards = len(rewards)
+        round_ids = np.zeros(num_rewards, dtype="int")
+        earnings = np.zeros(num_rewards)
+        for i in range(num_rewards):
+            round_ids[i] = rewards[i]["_id"]
+            earnings[i] = rewards[i]["amount"]
 
-        rj = r.json()
-        results = rj['submissions']['results']
-        scores = np.zeros(len(results))
-        for i in range(len(results)):
-            scores[i] = results[i]['accuracy_score']
-        return (scores, r.status_code)
+        return (round_ids, earnings)
 
+    def get_scores_for_user(self, username=None):
+        """get scores for specified user"""
+        self.logger.info("getting scores for user...")
 
-    def get_user(self, username):
-        leaderboard, status_code = self.get_leaderboard()
-        if status_code != 200:
-            return (None, None, None, None, None, None, None, None, status_code)
+        # get all competitions
+        competitions = self.get_all_competitions()
 
-        for user in leaderboard[0]['leaderboard']:
-            if user['username'] == username:
-                uname = user['username']
-                sid = user['submission_id']
-                val_logloss = np.float(user['logloss']['validation'])
-                val_consistency = np.float(user['logloss']['consistency'])
-                career_usd = np.float(user['earnings']['career']['usd'].replace(',',''))
-                career_nmr = np.float(user['earnings']['career']['nmr'].replace(',',''))
-                concordant = user['concordant']
-                original = user['original']
-                return (uname, sid, val_logloss, val_consistency, original, concordant, career_usd, career_nmr, status_code)
-        return (None, None, None, None, None, None, None, None, status_code)
+        # set up variables to parse and store scores
+        username = self.__get_username(username)
+        num_competitions = len(competitions)
+        validation_scores = []
+        consistency_scores = []
+        round_ids = []
 
+        # loop over compitions to append scores
+        for i in range(num_competitions):
+            # get submissions for user for round i
+            competition = competitions[i]
+            leaderboard = competition["leaderboard"]
+            submissions = list(filter(lambda s: s["username"] == username,
+                                      leaderboard))
 
-    def login(self):
-        r = requests.post(self._login_url, data=self.credentials)
-        if r.status_code != 201:
-            return (None, None, None, r.status_code)
+            # append scores if any exist for round i
+            if submissions:
+                logloss = submissions[0]["logloss"]
+                validation_scores.append(logloss["validation"])
+                consistency_scores.append(logloss["consistency"])
+                round_ids.append(competition["_id"])
 
-        rj = r.json()
-        return(rj['accessToken'], rj['refreshToken'], rj['id'], r.status_code)
+        # convert score arrays to numpy arrays
+        validation_scores = np.array(validation_scores)
+        consistency_scores = np.array(consistency_scores)
+        round_ids = np.array(round_ids, dtype="int")
 
+        return (validation_scores, consistency_scores, round_ids)
 
-    def authorize(self, file_path):
-        accessToken, _, _, status_code = self.login()
-        if status_code != 201:
-            return (None, None, None, status_code)
+    def get_user(self, username=None):
+        """get user information"""
+        self.logger.info("getting user...")
 
-        headers = {'Authorization':'Bearer {0}'.format(accessToken)}
+        # construct user request URL
+        username = self.__get_username(username)
+        user_req_url = self.__get_url("users") + "/" + username
 
-        r = requests.post(self._auth_url,
-                          data={'filename':file_path.split('/')[-1], 'mimetype': 'text/csv'},
-                          headers=headers)
-        if r.status_code != 200:
-            return (None, None, None, r.status_code)
+        # send user request
+        user_res = requests.get(user_req_url)
+        user_res.raise_for_status()
 
-        rj = r.json()
-        return (rj['filename'], rj['signedRequest'], headers, r.status_code)
+        # parse user response
+        user = user_res.json()
 
+        return user
 
-    def get_current_competition(self):
-        now = datetime.now()
-        leaderboard, status_code = self.get_leaderboard()
-        if status_code != 200:
-            return (None, None, None, None, status_code)
+    def get_submission_for_round(self, username=None, round_id=None):
+        """gets submission for single round"""
+        self.logger.info("getting user submission for round...")
 
-        for c in leaderboard:
-            start_date = datetime.strptime(c['start_date'], '%Y-%m-%dT%H:%M:%S.%fZ')
-            end_date = datetime.strptime(c['end_date'], '%Y-%m-%dT%H:%M:%S.%fZ')
-            if start_date < now < end_date:
-                return (c['dataset_id'], c['_id'], status_code)
+        # get username for filtering competition leaderboard
+        username = self.__get_username(username)
 
+        # get competition for specified round
+        competition = self.get_competition(round_id=round_id)
 
-    def upload_prediction(self, file_path):
-        filename, signedRequest, headers, status_code = self.authorize(file_path)
-        if status_code != 200:
-            return status_code
+        # parse user submission data
+        for user in competition["leaderboard"]:
+            if user["username"] == username:
+                submission_id = user["submission_id"]
+                logloss_val = np.float(user["logloss"]["validation"])
+                logloss_consistency = np.float(user["logloss"]["consistency"])
+                career_usd = np.float(user["earnings"]["career"]["usd"].replace(",", ""))
+                career_nmr = np.float(user["earnings"]["career"]["nmr"].replace(",", ""))
+                concordant = user["concordant"]
+                original = user["original"]
 
-        dataset_id, comp_id, status_code = self.get_current_competition()
-        if status_code != 200:
-            return status_code
+                return (username, submission_id, logloss_val, logloss_consistency,
+                        career_usd, career_nmr, concordant, original)
 
-        with open(file_path, 'rb') as fp:
-            r = requests.Request('PUT', signedRequest, data=fp.read())
-            prepped = r.prepare()
-            s = requests.Session()
-            resp = s.send(prepped)
-            if resp.status_code != 200:
-                return resp.status_code
+        # return an empty tuple if user is not on the leaderboard
+        self.logger.warning("user \"{0}\" is not on leaderboard".format(username))
+        return ()
 
-        r = requests.post(self._submissions_url,
-                          data={'competition_id':comp_id, 'dataset_id':dataset_id, 'filename':filename},
-                          headers=headers)
+    def upload_predictions(self, file_path):
+        """uploads predictions from file"""
+        self.logger.info("uploading prediction...")
 
-        return r.status_code
+        # parse information for file upload
+        filename, signed_url, headers = self.__authorize_file_upload(file_path)
+
+        # get information for current competition
+        competition = self.get_competition()
+        dataset_id = competition["dataset_id"]
+        competition_id = competition["_id"]
+
+        # open file
+        with open(file_path, "rb") as fp:
+            # upload file
+            file_res = requests.Request("PUT", signed_url, data=fp.read())
+            prepared_file_res = file_res.prepare()
+            req_session = requests.Session()
+            res_prepped = req_session.send(prepared_file_res)
+            res_prepped.raise_for_status()
+
+        # get submission URL
+        sub_url = self.__get_url("submissions")
+        # construct submission data
+        sub_data = {
+            "competition_id": competition_id,
+            "dataset_id": dataset_id,
+            "filename": filename
+        }
+
+        # send file request
+        sub_res = requests.post(sub_url, data=sub_data, headers=headers)
+        sub_res.raise_for_status()
+
+        return True
